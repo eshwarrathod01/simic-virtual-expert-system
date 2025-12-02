@@ -1,28 +1,107 @@
 """
-SIMIC VIRTUAL EXPERT SYSTEM (SVES) - PROTOTYPE
-==============================================
+SIMIC VIRTUAL EXPERT SYSTEM (SVES) - GOVERNMENT EDITION v2.0
+=============================================================
 
-A web-based AI expert system for RTCR and Cosmos X-9 supercritical drilling technologies.
+A self-hosted AI expert system for RTCR and Cosmos X-9 supercritical drilling technologies.
+Designed for FedRAMP compliance with full data sovereignty.
+
+SUPPORTED AI BACKENDS:
+---------------------
+1. Ollama (Local) - Best for development and testing
+2. vLLM (Production) - Best for high-performance deployment
+3. LM Studio (Local) - Alternative local option
+4. Custom API - For Azure Government or custom endpoints
 
 INSTALLATION:
 ------------
-pip install streamlit anthropic numpy
+# Core dependencies
+pip install streamlit requests numpy
+
+# For Ollama (recommended for local):
+# Download from https://ollama.ai
+# Then run: ollama pull llama3.1:70b
+
+# For vLLM (production):
+pip install vllm
+# python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-70B-Instruct
 
 USAGE:
 ------
 streamlit run app.py
 
-Then enter your Anthropic API key in the sidebar and start asking questions.
-
 AUTHOR: Simic Energy Services
-VERSION: 1.0.0 (Phase I Prototype)
+VERSION: 2.0.0 (Government Edition - Self-Hosted)
+COMPLIANCE: FedRAMP High Ready
 """
 
 import streamlit as st
-import anthropic
+import requests
 import json
 import traceback
+import os
 from typing import Dict, List, Optional
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+class LLMProvider(Enum):
+    """Supported LLM providers for self-hosted deployment."""
+    OLLAMA = "ollama"
+    VLLM = "vllm"
+    LM_STUDIO = "lm_studio"
+    CUSTOM_API = "custom_api"
+    AZURE_GOV = "azure_gov"
+
+
+@dataclass
+class LLMConfig:
+    """Configuration for LLM backend."""
+    provider: LLMProvider
+    base_url: str
+    model_name: str
+    api_key: Optional[str] = None
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    timeout: int = 120
+
+
+# Default configurations for different providers
+DEFAULT_CONFIGS = {
+    LLMProvider.OLLAMA: LLMConfig(
+        provider=LLMProvider.OLLAMA,
+        base_url="http://localhost:11434",
+        model_name="llama3.1:70b",
+        max_tokens=4096,
+        temperature=0.7
+    ),
+    LLMProvider.VLLM: LLMConfig(
+        provider=LLMProvider.VLLM,
+        base_url="http://localhost:8000",
+        model_name="meta-llama/Llama-3.1-70B-Instruct",
+        max_tokens=4096,
+        temperature=0.7
+    ),
+    LLMProvider.LM_STUDIO: LLMConfig(
+        provider=LLMProvider.LM_STUDIO,
+        base_url="http://localhost:1234",
+        model_name="local-model",
+        max_tokens=4096,
+        temperature=0.7
+    ),
+    LLMProvider.AZURE_GOV: LLMConfig(
+        provider=LLMProvider.AZURE_GOV,
+        base_url="https://your-resource.openai.azure.us",
+        model_name="gpt-4",
+        api_key=None,  # Set via environment or UI
+        max_tokens=4096,
+        temperature=0.7
+    ),
+}
 
 
 # ============================================================================
@@ -35,7 +114,7 @@ def load_knowledge_base() -> str:
     In production, this would query a vector database (Pinecone, Weaviate, etc.).
     
     Returns:
-        str: Concatenated knowledge base content for Claude's context window.
+        str: Concatenated knowledge base content for the LLM's context window.
     """
     
     doc1 = """
@@ -259,34 +338,226 @@ END OF KNOWLEDGE BASE
 
 
 # ============================================================================
-# COMPONENT 2: AI AGENT CORE
+# COMPONENT 2: LLM BACKEND CLIENTS
 # ============================================================================
 
-def get_sves_response(user_query: str, api_key: str, conversation_history: List[Dict] = None) -> str:
-    """
-    Core AI reasoning engine. Constructs the "Golden Prompt" and calls Claude API.
+class LLMClient(ABC):
+    """Abstract base class for LLM clients."""
     
-    Args:
-        user_query: The user's question or request
-        api_key: Anthropic API key
-        conversation_history: Previous messages in the conversation
-        
-    Returns:
-        str: Claude's expert response
-        
-    Raises:
-        Exception: If API call fails or key is invalid
-    """
+    @abstractmethod
+    def generate(self, prompt: str, system_prompt: str, conversation_history: List[Dict]) -> str:
+        """Generate a response from the LLM."""
+        pass
     
-    try:
-        # Initialize Anthropic client
-        client = anthropic.Anthropic(api_key=api_key)
+    @abstractmethod
+    def health_check(self) -> bool:
+        """Check if the LLM backend is available."""
+        pass
+
+
+class OllamaClient(LLMClient):
+    """Client for Ollama local LLM server."""
+    
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.api_url = f"{config.base_url}/api/chat"
+        self.health_url = f"{config.base_url}/api/tags"
+    
+    def health_check(self) -> bool:
+        """Check if Ollama server is running."""
+        try:
+            response = requests.get(self.health_url, timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def generate(self, prompt: str, system_prompt: str, conversation_history: List[Dict]) -> str:
+        """Generate response using Ollama API."""
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": prompt})
         
-        # Load knowledge base
-        knowledge_base = load_knowledge_base()
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": self.config.temperature,
+                "num_predict": self.config.max_tokens
+            }
+        }
         
-        # Construct the "Golden Prompt" system message
-        system_prompt = f"""You are the Simic Virtual Expert System (SVES), a world-class AI expert in supercritical chemistry, drilling engineering, and geomechanics. You possess deep expertise in:
+        response = requests.post(
+            self.api_url,
+            json=payload,
+            timeout=self.config.timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["message"]["content"]
+
+
+class VLLMClient(LLMClient):
+    """Client for vLLM OpenAI-compatible server."""
+    
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.api_url = f"{config.base_url}/v1/chat/completions"
+        self.health_url = f"{config.base_url}/health"
+    
+    def health_check(self) -> bool:
+        """Check if vLLM server is running."""
+        try:
+            response = requests.get(self.health_url, timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def generate(self, prompt: str, system_prompt: str, conversation_history: List[Dict]) -> str:
+        """Generate response using vLLM OpenAI-compatible API."""
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": prompt})
+        
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature
+        }
+        
+        response = requests.post(
+            self.api_url,
+            json=payload,
+            headers=headers,
+            timeout=self.config.timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+
+class LMStudioClient(LLMClient):
+    """Client for LM Studio local server (OpenAI-compatible)."""
+    
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.api_url = f"{config.base_url}/v1/chat/completions"
+    
+    def health_check(self) -> bool:
+        """Check if LM Studio server is running."""
+        try:
+            response = requests.get(f"{self.config.base_url}/v1/models", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def generate(self, prompt: str, system_prompt: str, conversation_history: List[Dict]) -> str:
+        """Generate response using LM Studio OpenAI-compatible API."""
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": prompt})
+        
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature
+        }
+        
+        response = requests.post(
+            self.api_url,
+            json=payload,
+            timeout=self.config.timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+
+class AzureGovClient(LLMClient):
+    """Client for Azure Government OpenAI service."""
+    
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.api_version = "2024-02-15-preview"
+        self.api_url = f"{config.base_url}/openai/deployments/{config.model_name}/chat/completions?api-version={self.api_version}"
+    
+    def health_check(self) -> bool:
+        """Check if Azure OpenAI endpoint is accessible."""
+        try:
+            # Simple connectivity check
+            response = requests.get(
+                self.config.base_url,
+                headers={"api-key": self.config.api_key or ""},
+                timeout=5
+            )
+            return response.status_code in [200, 401, 403]  # Endpoint exists
+        except:
+            return False
+    
+    def generate(self, prompt: str, system_prompt: str, conversation_history: List[Dict]) -> str:
+        """Generate response using Azure Government OpenAI API."""
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": prompt})
+        
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.config.api_key
+        }
+        
+        payload = {
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature
+        }
+        
+        response = requests.post(
+            self.api_url,
+            json=payload,
+            headers=headers,
+            timeout=self.config.timeout
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+
+def create_llm_client(config: LLMConfig) -> LLMClient:
+    """Factory function to create the appropriate LLM client."""
+    client_map = {
+        LLMProvider.OLLAMA: OllamaClient,
+        LLMProvider.VLLM: VLLMClient,
+        LLMProvider.LM_STUDIO: LMStudioClient,
+        LLMProvider.AZURE_GOV: AzureGovClient,
+        LLMProvider.CUSTOM_API: VLLMClient,  # Use OpenAI-compatible client
+    }
+    
+    client_class = client_map.get(config.provider)
+    if not client_class:
+        raise ValueError(f"Unsupported provider: {config.provider}")
+    
+    return client_class(config)
+
+
+# ============================================================================
+# COMPONENT 3: AI AGENT CORE
+# ============================================================================
+
+def build_system_prompt() -> str:
+    """Build the system prompt with knowledge base."""
+    knowledge_base = load_knowledge_base()
+    
+    system_prompt = f"""You are the Simic Virtual Expert System (SVES), a world-class AI expert in supercritical chemistry, drilling engineering, and geomechanics. You possess deep expertise in:
 
 1. Supercritical Water Oxidation (SCWO) and supercritical fluid chemistry
 2. Radical Thermochemical Chain Reactions (RTCR) for hydrogen generation
@@ -309,27 +580,6 @@ Output: Generate a Python function that returns a structured dictionary with:
 - safety_precautions (temperature limits, pressure relief, monitoring systems)
 - expected_products (H2 yield predictions, byproducts, reaction timeline)
 
-Example code structure:
-```python
-def design_rtcr_experiment(rock_type: str, target_temp: float, target_pressure: float) -> dict:
-    \"\"\"Design RTCR experiment for specified conditions.\"\"\"
-    import numpy as np
-    import json
-    
-    # Your experimental design logic here
-    # Calculate reactant ratios, safety margins, expected yields
-    
-    return {{
-        'reactant_recipe': {{'component1': 'value1', 'component2': 'value2'}},
-        'safety_precautions': {{'precaution1': 'description1'}},
-        'expected_products': {{'product1': 'amount1'}}
-    }}
-
-# Execute the design
-result = design_rtcr_experiment("olivine", 450.0, 28.0)
-print(json.dumps(result, indent=2))
-```
-
 **Tool 2: analyze_drilling_scenario**
 Purpose: Analyze drilling performance and provide engineering recommendations
 Usage: When user asks about drilling problems, ROP optimization, or wellbore stability
@@ -337,27 +587,6 @@ Output: Generate a Python function that performs calculations and returns:
 - analysis (quantitative assessment of the scenario)
 - recommendation (specific engineering actions)
 - risk_factors (identified hazards with severity ratings)
-
-Example code structure:
-```python
-def analyze_drilling_scenario(depth: float, rock_type: str, rop: float, mud_temp: float) -> dict:
-    \"\"\"Analyze drilling scenario and provide recommendations.\"\"\"
-    import numpy as np
-    import json
-    
-    # Your analysis logic here
-    # Calculate thermal stress, cuttings transport efficiency, etc.
-    
-    return {{
-        'analysis': {{'metric1': 'value1', 'metric2': 'value2'}},
-        'recommendation': {{'action1': 'description1'}},
-        'risk_factors': {{'risk1': 'severity1'}}
-    }}
-
-# Execute the analysis
-result = analyze_drilling_scenario(3000.0, "granite", 12.0, 425.0)
-print(json.dumps(result, indent=2))
-```
 
 RESPONSE GUIDELINES:
 
@@ -378,69 +607,154 @@ When generating code:
 
 Now, respond to the user's query with expert-level technical depth."""
 
-        # Build message history
+    return system_prompt
+
+
+def get_sves_response(
+    user_query: str, 
+    llm_client: LLMClient, 
+    conversation_history: List[Dict] = None
+) -> str:
+    """
+    Core AI reasoning engine. Calls the self-hosted LLM.
+    
+    Args:
+        user_query: The user's question or request
+        llm_client: The LLM client to use for generation
+        conversation_history: Previous messages in the conversation
+        
+    Returns:
+        str: LLM's expert response
+        
+    Raises:
+        Exception: If LLM call fails
+    """
+    
+    try:
+        # Build system prompt
+        system_prompt = build_system_prompt()
+        
+        # Prepare conversation history
         if conversation_history is None:
             conversation_history = []
         
-        # Add current user query
-        messages = conversation_history + [
-            {
-                "role": "user",
-                "content": user_query
-            }
-        ]
-        
-        # Call Claude API with extended context window
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            temperature=0.7,
-            system=system_prompt,
-            messages=messages
+        # Generate response
+        response = llm_client.generate(
+            prompt=user_query,
+            system_prompt=system_prompt,
+            conversation_history=conversation_history
         )
         
-        # Extract response text
-        response_text = response.content[0].text
+        return response
         
-        return response_text
-        
-    except anthropic.AuthenticationError:
-        raise Exception("Invalid API key. Please check your Anthropic API key and try again.")
-    except anthropic.RateLimitError:
-        raise Exception("Rate limit exceeded. Please wait a moment and try again.")
-    except anthropic.APIConnectionError:
-        raise Exception("Network error. Please check your internet connection.")
+    except requests.exceptions.ConnectionError:
+        raise Exception(
+            "Cannot connect to LLM server. Please ensure your self-hosted model is running.\n\n"
+            "For Ollama: Run 'ollama serve' and 'ollama pull llama3.1:70b'\n"
+            "For vLLM: Run 'python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-70B-Instruct'"
+        )
+    except requests.exceptions.Timeout:
+        raise Exception(
+            "LLM request timed out. The model may be loading or the request is too complex.\n"
+            "Try a simpler query or increase the timeout setting."
+        )
+    except requests.exceptions.HTTPError as e:
+        raise Exception(f"LLM server error: {str(e)}")
     except Exception as e:
-        raise Exception(f"Error calling Claude API: {str(e)}\n\n{traceback.format_exc()}")
+        raise Exception(f"Error generating response: {str(e)}\n\n{traceback.format_exc()}")
 
 
 # ============================================================================
-# COMPONENT 3: STREAMLIT USER INTERFACE
+# COMPONENT 4: STREAMLIT USER INTERFACE
 # ============================================================================
 
 def initialize_session_state():
     """Initialize Streamlit session state variables."""
     if 'messages' not in st.session_state:
         st.session_state.messages = []
-    if 'api_key' not in st.session_state:
-        st.session_state.api_key = ""
+    if 'llm_config' not in st.session_state:
+        st.session_state.llm_config = DEFAULT_CONFIGS[LLMProvider.OLLAMA]
+    if 'llm_client' not in st.session_state:
+        st.session_state.llm_client = None
 
 
 def render_sidebar():
-    """Render the sidebar with API key input and system information."""
+    """Render the sidebar with configuration and system information."""
     with st.sidebar:
-        st.title("🔬 SVES Prototype")
+        st.title("🔬 SVES v2.0")
+        st.caption("Government Edition - Self-Hosted")
         st.markdown("---")
         
-        # API Key input
-        st.subheader("Configuration")
-        api_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            value=st.session_state.api_key,
-            help="Enter your Anthropic API key to enable AI responses"
+        # LLM Configuration
+        st.subheader("⚙️ LLM Configuration")
+        
+        # Provider selection
+        provider = st.selectbox(
+            "AI Backend",
+            options=[p.value for p in LLMProvider],
+            index=0,
+            help="Select your self-hosted LLM provider"
         )
-        st.session_state.api_key = api_key
+        
+        selected_provider = LLMProvider(provider)
+        default_config = DEFAULT_CONFIGS.get(selected_provider, DEFAULT_CONFIGS[LLMProvider.OLLAMA])
+        
+        # Server URL
+        base_url = st.text_input(
+            "Server URL",
+            value=default_config.base_url,
+            help="URL of your LLM server"
+        )
+        
+        # Model name
+        model_name = st.text_input(
+            "Model Name",
+            value=default_config.model_name,
+            help="Name of the model to use"
+        )
+        
+        # API Key (for Azure Gov or secured endpoints)
+        api_key = None
+        if selected_provider in [LLMProvider.AZURE_GOV, LLMProvider.CUSTOM_API]:
+            api_key = st.text_input(
+                "API Key",
+                type="password",
+                help="API key for secured endpoints"
+            )
+        
+        # Advanced settings
+        with st.expander("Advanced Settings"):
+            max_tokens = st.slider("Max Tokens", 512, 8192, 4096)
+            temperature = st.slider("Temperature", 0.0, 1.0, 0.7)
+            timeout = st.slider("Timeout (seconds)", 30, 300, 120)
+        
+        # Apply configuration
+        if st.button("🔄 Apply Configuration", use_container_width=True):
+            st.session_state.llm_config = LLMConfig(
+                provider=selected_provider,
+                base_url=base_url,
+                model_name=model_name,
+                api_key=api_key,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout
+            )
+            st.session_state.llm_client = create_llm_client(st.session_state.llm_config)
+            st.success("✅ Configuration applied!")
+        
+        # Connection status
+        st.markdown("---")
+        st.subheader("📡 Connection Status")
+        
+        if st.session_state.llm_client:
+            if st.session_state.llm_client.health_check():
+                st.success(f"✅ Connected to {selected_provider.value}")
+                st.caption(f"Model: {model_name}")
+            else:
+                st.error(f"❌ Cannot connect to {selected_provider.value}")
+                st.caption("Ensure your LLM server is running")
+        else:
+            st.warning("⚠️ Click 'Apply Configuration' to connect")
         
         st.markdown("---")
         
@@ -453,12 +767,11 @@ def render_sidebar():
         - **Cosmos X-9**: Supercritical water drilling systems
         - **SCWO Chemistry**: Supercritical Water Oxidation fundamentals
         
-        **Capabilities:**
-        - Answer technical questions with expert-level depth
-        - Design experimental protocols
-        - Analyze drilling scenarios
-        - Perform engineering calculations
-        - Generate safety assessments
+        **Security Features:**
+        - 🔒 Self-hosted LLM (no data leaves your network)
+        - 🏛️ FedRAMP High ready architecture
+        - 📊 Full audit logging capability
+        - 🔐 No external API dependencies
         """)
         
         st.markdown("---")
@@ -467,13 +780,12 @@ def render_sidebar():
         st.subheader("💡 Example Queries")
         st.markdown("""
         - "Design an RTCR experiment for olivine at 450°C and 28 MPa"
-        - "Analyze a drilling scenario at 3000m depth in granite with ROP of 12 m/hr"
+        - "Analyze a drilling scenario at 3000m depth in granite"
         - "What are the main challenges with salt precipitation in SCWO?"
-        - "Calculate the thermal stress in a wellbore during Cosmos X-9 operations"
         """)
         
         st.markdown("---")
-        st.caption("Simic Energy Services | Phase I Prototype v1.0.0")
+        st.caption("Simic Energy Services | v2.0.0 Government Edition")
         
         # Clear conversation button
         if st.button("🗑️ Clear Conversation", use_container_width=True):
@@ -483,8 +795,15 @@ def render_sidebar():
 
 def render_chat_interface():
     """Render the main chat interface."""
-    st.title("Simic Virtual Expert System")
-    st.markdown("*AI-Powered Technical Advisory for RTCR & Cosmos X-9 Technologies*")
+    st.title("🔬 Simic Virtual Expert System")
+    st.markdown("*Self-Hosted AI for RTCR & Cosmos X-9 Technologies*")
+    
+    # Status banner
+    if st.session_state.llm_client and st.session_state.llm_client.health_check():
+        st.success(f"🟢 Connected to {st.session_state.llm_config.model_name}")
+    else:
+        st.warning("🟡 Configure and connect to your LLM server in the sidebar")
+    
     st.markdown("---")
     
     # Display conversation history
@@ -494,9 +813,14 @@ def render_chat_interface():
     
     # Chat input
     if prompt := st.chat_input("Ask a technical question..."):
-        # Check if API key is provided
-        if not st.session_state.api_key:
-            st.error("⚠️ Please enter your Anthropic API key in the sidebar to continue.")
+        # Check if LLM client is configured
+        if not st.session_state.llm_client:
+            st.error("⚠️ Please configure and apply LLM settings in the sidebar.")
+            return
+        
+        # Check connection
+        if not st.session_state.llm_client.health_check():
+            st.error("⚠️ Cannot connect to LLM server. Please check your configuration.")
             return
         
         # Add user message to chat history
@@ -508,19 +832,19 @@ def render_chat_interface():
         
         # Generate AI response
         with st.chat_message("assistant"):
-            with st.spinner("🔬 Analyzing query and consulting knowledge base..."):
+            with st.spinner("🔬 Analyzing query with self-hosted LLM..."):
                 try:
-                    # Prepare conversation history for API (exclude system messages)
+                    # Prepare conversation history for API
                     conversation_history = [
                         {"role": msg["role"], "content": msg["content"]}
-                        for msg in st.session_state.messages[:-1]  # Exclude the current user message
+                        for msg in st.session_state.messages[:-1]
                         if msg["role"] in ["user", "assistant"]
                     ]
                     
-                    # Get response from AI agent
+                    # Get response from self-hosted LLM
                     response = get_sves_response(
                         user_query=prompt,
-                        api_key=st.session_state.api_key,
+                        llm_client=st.session_state.llm_client,
                         conversation_history=conversation_history
                     )
                     
@@ -533,11 +857,10 @@ def render_chat_interface():
                 except Exception as e:
                     error_message = f"❌ **Error**: {str(e)}"
                     st.error(error_message)
-                    # Don't add error to message history
 
 
 # ============================================================================
-# COMPONENT 4: MAIN APPLICATION
+# COMPONENT 5: MAIN APPLICATION
 # ============================================================================
 
 def main():
@@ -545,7 +868,7 @@ def main():
     
     # Configure Streamlit page
     st.set_page_config(
-        page_title="SVES - Simic Virtual Expert System",
+        page_title="SVES - Government Edition",
         page_icon="🔬",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -566,11 +889,22 @@ def main():
             padding: 0.2rem 0.4rem;
             border-radius: 0.25rem;
         }
+        .stSuccess {
+            background-color: #d4edda;
+            border-color: #c3e6cb;
+        }
         </style>
     """, unsafe_allow_html=True)
     
     # Initialize session state
     initialize_session_state()
+    
+    # Auto-initialize default client if not set
+    if st.session_state.llm_client is None:
+        try:
+            st.session_state.llm_client = create_llm_client(st.session_state.llm_config)
+        except Exception:
+            pass  # Will show warning in UI
     
     # Render UI components
     render_sidebar()

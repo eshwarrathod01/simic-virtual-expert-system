@@ -1,3 +1,19 @@
+# SVES v2.0 Government Edition - Self-Hosted Dependencies
+# =========================================================
+
+# Core Framework
 streamlit>=1.28.0
-anthropic>=0.34.0
+
+# HTTP Client (for self-hosted LLM communication)
+requests>=2.31.0
+
+# Numerical Computing
 numpy>=1.24.0
+
+# Optional: For production vLLM deployment
+# pip install vllm  # Requires CUDA-capable GPU
+
+# For local development with Ollama:
+# 1. Download Ollama from https://ollama.ai
+# 2. Run: ollama pull llama3.1:70b
+# 3. Start: ollama serve
